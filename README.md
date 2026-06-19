@@ -17,12 +17,13 @@
 7. [Network commands](#7-network-commands)
 8. [Volume / data persistence commands](#8-volume--data-persistence-commands)
 9. [System / housekeeping commands](#9-system--housekeeping-commands)
-10. [Docker Compose](#10-docker-compose)
-11. [Build tooling — Builder / Buildx](#11-build-tooling--builder--buildx)
-12. [Swarm / orchestration](#12-swarm--orchestration)
-13. [Other management groups (context, plugin, manifest, scout, ai)](#13-other-management-groups)
-14. [Global options](#14-global-options)
-15. [Cheat-sheet & typical workflows](#15-cheat-sheet--typical-workflows)
+10. [Writing a Dockerfile](#10-writing-a-dockerfile)
+11. [Docker Compose](#11-docker-compose)
+12. [Build tooling — Builder / Buildx](#12-build-tooling--builder--buildx)
+13. [Swarm / orchestration](#13-swarm--orchestration)
+14. [Other management groups (context, plugin, manifest, scout, ai)](#14-other-management-groups)
+15. [Global options](#15-global-options)
+16. [Cheat-sheet & typical workflows](#16-cheat-sheet--typical-workflows)
 
 ---
 
@@ -703,9 +704,183 @@ Daemon-wide info and cleanup, under `docker system …`.
 
 ---
 
-## 10. Docker Compose
+## 10. Writing a Dockerfile
+
+A **Dockerfile** is the **recipe** (§1) that `docker build` follows to produce an image. It is a plain text file — literally named `Dockerfile`, no extension — that lists instructions **top to bottom**, one per line. Each instruction adds a **layer** to the image.
+
+> **Mental model:** you start from a base image (`FROM`), copy your code in, install dependencies, and finally say what command to run when the container starts (`CMD`). Build it with `docker build -t myapp .` (see §4) and run it with `docker run myapp`.
+
+### The instructions you actually need
+
+Every instruction below follows the form `INSTRUCTION arguments`. Instruction keywords are conventionally UPPERCASE.
+
+| Instruction | What it does | When / why |
+|-------------|--------------|------------|
+| `FROM image:tag` | Picks the **base image** to build on top of. **Must be the first instruction.** | Always. Prefer a **specific tag** (`node:20-slim`, not `node`) so builds are reproducible. `-slim`/`-alpine` variants are much smaller. |
+| `WORKDIR /app` | Sets the working directory for everything after it (and creates it). | Right after `FROM`. Avoids messy `cd` and absolute paths. |
+| `COPY src dest` | Copies files **from your project** into the image. | To get your code/deps into the image. **Prefer `COPY`.** |
+| `ADD src dest` | Like `COPY` but also unpacks local tarballs and can fetch URLs. | Only when you actually need auto-extract/URL. Otherwise use `COPY`. |
+| `RUN cmd` | Runs a shell command **at build time** and saves the result as a layer. | Installing packages, building assets. Chain with `&&` to keep layers small. |
+| `ENV KEY=value` | Sets an environment variable **available at build time and in the running container**. | Runtime config defaults (`NODE_ENV=production`). |
+| `ARG KEY=value` | A **build-time-only** variable, set with `--build-arg`. Gone at runtime. | Build options (e.g. which version to install). |
+| `EXPOSE 3000` | **Documents** which port the app listens on. | Communication/intent. It does **not** publish the port — you still need `-p` / Compose `ports:`. |
+| `USER appuser` | Switches to a non-root user for following instructions and at runtime. | Security — avoid running as root. |
+| `VOLUME /data` | Marks a path as a mount point for external storage. | Data that must persist outside the image. |
+| `CMD [...]` | The **default command** run when the container starts. | Exactly one effective `CMD`. Easily overridden at `docker run`. |
+| `ENTRYPOINT [...]` | The **fixed executable** the container always runs. | When the container *is* a specific program. |
+
+#### `CMD` vs `ENTRYPOINT` (the one that confuses everyone)
+
+- **`CMD`** = the *default* command. `docker run myapp somethingelse` **replaces** it entirely.
+- **`ENTRYPOINT`** = the command that *always* runs; anything you pass on `docker run` is appended as **arguments** to it.
+- Common pattern: `ENTRYPOINT ["python", "app.py"]` + `CMD ["--port", "5000"]` → default args you can override while the program stays fixed.
+- Always prefer the **exec form** (a JSON array: `CMD ["node", "server.js"]`) over the shell form (`CMD node server.js`) — the exec form receives Unix signals correctly, so `docker stop` shuts your app down cleanly.
+
+### Layer caching — the #1 thing that makes builds fast
+
+Docker caches each instruction's layer and **reuses it until something changes**; once a layer's inputs change, that layer and **every layer after it** rebuild. So **order matters**: copy your dependency manifest and install **before** copying the rest of your code. Then editing your source doesn't bust the (slow) dependency-install layer.
+
+```dockerfile
+# GOOD — deps install layer is cached across code edits
+COPY package*.json ./
+RUN npm ci
+COPY . .            # only this layer rebuilds when you change source
+```
+```dockerfile
+# BAD — any code change re-runs the slow install every build
+COPY . .
+RUN npm ci
+```
+
+### `.dockerignore` — keep junk out of the build
+
+Put a `.dockerignore` next to your Dockerfile. It works like `.gitignore` and stops big/secret files from being sent into the build (smaller images, faster builds, no leaked secrets):
+
+```gitignore
+node_modules
+.git
+.env
+*.log
+__pycache__
+```
+
+### Two complete Dockerfiles, side by side
+
+**Node.js (Express)** — assumes a `package.json` and a `server.js`:
+
+```dockerfile
+# Dockerfile
+FROM node:20-slim                 # small, pinned base image
+WORKDIR /app                      # work inside /app
+COPY package*.json ./             # copy manifests first (cache-friendly)
+RUN npm ci                        # install exact deps from package-lock.json
+COPY . .                          # now copy the rest of the source
+ENV NODE_ENV=production
+EXPOSE 3000                       # documents the port the app listens on
+USER node                         # drop root for safety (node user ships in the image)
+CMD ["node", "server.js"]         # default command (exec form)
+```
+
+**Python (Flask)** — assumes a `requirements.txt` and an `app.py`:
+
+```dockerfile
+# Dockerfile
+FROM python:3.12-slim             # small, pinned base image
+WORKDIR /app                      # work inside /app
+COPY requirements.txt .           # copy manifest first (cache-friendly)
+RUN pip install --no-cache-dir -r requirements.txt
+COPY . .                          # now copy the rest of the source
+ENV PYTHONUNBUFFERED=1            # show logs immediately, don't buffer
+EXPOSE 5000                       # documents the port the app listens on
+CMD ["python", "app.py"]          # default command (exec form)
+```
+
+Build and run either one the same way:
+
+```bash
+docker build -t myapp:1.0 .       # read ./Dockerfile, build image myapp:1.0
+docker run -p 8080:3000 myapp:1.0 # publish container port 3000 on host 8080
+```
+
+### Multi-stage builds — small final images
+
+A **multi-stage** build uses one stage to compile/install and a second, slim stage that copies **only the finished artifacts**. The heavy build tools never end up in the image you ship. You name stages with `AS` and copy between them with `COPY --from=`.
+
+```dockerfile
+# ---- stage 1: build ----
+FROM node:20 AS build
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
+COPY . .
+RUN npm run build                 # produces ./dist
+
+# ---- stage 2: runtime (only the built output) ----
+FROM nginx:alpine
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80
+# nginx image already has a CMD that starts the server
+```
+
+The final image contains nginx + your built files — none of Node, npm, or your source.
+
+---
+
+## 11. Docker Compose
 
 **What is Compose?** Real apps usually need several containers (web + database + cache). Typing many `docker run` commands and wiring networks by hand is tedious. **Docker Compose lets you describe your whole multi-container app in one YAML file** (`compose.yaml`) and manage it all with single commands. Run with `docker compose …`.
+
+### Writing a `compose.yaml`
+
+The file is YAML (indentation matters — use spaces, not tabs). The top-level key is `services:`; **each service becomes one container**. Here are the keys you'll reach for:
+
+| Key | What it does | Notes |
+|-----|--------------|-------|
+| `services:` | The containers that make up your app. Each child key is a service name (and its hostname on the network). | `web`, `db`, `cache`, … |
+| `image:` | Use a **prebuilt image** from a registry. | e.g. `postgres:16`, `nginx`. |
+| `build:` | **Build from a local Dockerfile** instead of pulling an image. | `build: .` builds the §10 Dockerfile in the current folder. Use `image:` *or* `build:`. |
+| `ports:` | Publish container ports to the host. | Format `"HOST:CONTAINER"`, e.g. `"8080:3000"`. (Same idea as `-p`.) |
+| `environment:` | Set environment variables in the container. | `KEY: value`. For many/secret values use `env_file: .env`. |
+| `volumes:` | Persist or mount data. | **Named volume** `pgdata:/var/lib/...` (Docker-managed, for databases) vs **bind mount** `./src:/app` (live-edit host code) — see the volume note in §8. Named volumes must also be listed under the top-level `volumes:`. |
+| `depends_on:` | Start order — start `db` before `web`. | ⚠️ Waits for the container to **start**, not to be **ready**. Pair with a `healthcheck` + `condition: service_healthy` for true readiness. |
+| `healthcheck:` | A command Docker runs to test if the service is actually ready. | Lets other services wait for `service_healthy`. |
+| `restart:` | Restart policy if the container exits. | `unless-stopped` / `always` for long-running services. |
+| `command:` | Override the image's default `CMD`. | Handy for dev (e.g. a watch command). |
+| `networks:` | Custom networks. | Optional — Compose already puts all services on one shared default network where they reach each other **by service name** (e.g. `web` connects to `db` at host `db`). |
+
+#### A fuller, annotated example
+
+This builds the `web` image from your **§10 Dockerfile**, runs a Postgres `db` with a persistent volume + health check, and only starts `web` once the database is genuinely ready:
+
+```yaml
+services:
+  web:
+    build: .                      # build the Dockerfile in this folder (§10)
+    ports:
+      - "8080:3000"               # host 8080  ->  container 3000
+    environment:
+      DATABASE_URL: postgres://postgres:secret@db:5432/app  # 'db' = the service name
+    depends_on:
+      db:
+        condition: service_healthy   # wait until db's healthcheck passes
+    restart: unless-stopped
+
+  db:
+    image: postgres:16            # prebuilt image from Docker Hub
+    environment:
+      POSTGRES_PASSWORD: secret
+    volumes:
+      - pgdata:/var/lib/postgresql/data   # named volume -> data survives 'down'
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 5
+
+volumes:
+  pgdata:                         # declare the named volume used above
+```
+
+Bring it up with `docker compose up -d` (below). Because both services share Compose's default network, `web` reaches the database simply at the hostname `db`.
 
 A tiny `compose.yaml` so the examples make sense:
 
@@ -880,7 +1055,7 @@ volumes:
 
 ---
 
-## 11. Build tooling — Builder / Buildx
+## 12. Build tooling — Builder / Buildx
 
 Modern Docker builds use **BuildKit** (fast, cache-smart, parallel). **Buildx** is the extended build CLI that adds multi-platform builds and named builders. The `docker builder …` group manages build state/cache; `docker buildx …` drives advanced builds.
 
@@ -951,7 +1126,7 @@ Modern Docker builds use **BuildKit** (fast, cache-smart, parallel). **Buildx** 
 
 ---
 
-## 12. Swarm / orchestration
+## 13. Swarm / orchestration
 
 **What is orchestration?** Running containers on one laptop is easy; running them reliably across **many machines** (restarting on failure, scaling, rolling updates, load balancing) needs an **orchestrator**. **Docker Swarm** is Docker's built-in clustering/orchestration mode that turns a group of machines into one virtual Docker host. (Kubernetes is the larger industry alternative.)
 
@@ -987,7 +1162,7 @@ Once `docker swarm init` has run, these additional command groups become meaning
 
 ---
 
-## 13. Other management groups
+## 14. Other management groups
 
 Less common but real command groups on your install.
 
@@ -1046,7 +1221,7 @@ Less common but real command groups on your install.
 
 ---
 
-## 14. Global options
+## 15. Global options
 
 Flags that work on the `docker` command itself (placed before the subcommand). From `docker --help`:
 
@@ -1069,7 +1244,7 @@ docker --context remote ps          # same idea, via a saved context
 
 ---
 
-## 15. Cheat-sheet & typical workflows
+## 16. Cheat-sheet & typical workflows
 
 ### Most-used commands at a glance
 
